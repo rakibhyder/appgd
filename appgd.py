@@ -1,0 +1,560 @@
+import torch
+from torch import nn
+from os.path import isfile
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage.interpolation import rotate
+from skimage.measure import compare_ssim as ssim
+
+train_dataset='MNIST'
+test_dataset='MNIST'
+z_dim=20
+sub_dim_pool=[60]#
+sub_dim_mse=[]
+sub_dim_psnr=[]
+sub_dim_ssim=[]
+sub_dim_rec=[]
+for sub_dim in sub_dim_pool:
+    print(sub_dim)
+#    sub_dim=128#512
+    subtype_pool=['abs']# 'abs','linear','square','original'
+    train_z_type='PCA'
+    test_z_type='Gauss'#'Gauss'
+    train_epochs=500
+    
+    test_epochs=500
+    test_outer_epochs=50
+    test_middle_epoch1=1
+    test_middle_epoch2=1
+    
+    train_batch_size=256
+    test_batch_size=10
+    opt='SGD'
+    if opt=='SGD':
+        train_lr=1
+    elif opt=='Adam':
+        train_lr=1e-3
+    train_alpha=200
+    
+    z_norm_type='unit_norm'
+    x_init='random'#'power_project','spectral'
+    seed=100
+    random_restart=1
+
+
+    test_pow_epochs=800
+    eta=0.9
+    
+    if x_init=='power_project':
+      pow_it=10
+    else:
+        pow_it=500
+    train=0
+    test=1
+    mask_id=10
+    rotation_theta=0
+    test_start=0
+    test_size=10 # choose something greater than or equal to test_batcch_size (otherwise test_alpha should be normalized)
+    start_fig=0
+    mask_ratio=0.5
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
+    nz = z_dim
+    ngf = 32
+    ndf =32
+    if train_dataset=='MNIST' or train_dataset=='SVHN_gray' or train_dataset=='EMNIST_digit' or train_dataset=='FashionMNIST':
+        nc = 1
+    elif train_dataset=='SVHN' or train_dataset=='CIFAR10':
+        nc = 3
+        
+    class Generator(nn.Module):
+        def __init__(self, ngpu):
+            super(Generator, self).__init__()
+            self.ngpu = ngpu
+            self.main = nn.Sequential(
+                # input is Z, going into a convolution
+                nn.ConvTranspose2d(     nz, ngf * 8, 4, 1, 0, bias=False),
+    #            nn.BatchNorm2d(ngf * 8),
+                nn.ReLU(True),
+                # state size. (ngf*8) x 4 x 4
+                nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2,1, bias=False),
+    #            nn.BatchNorm2d(ngf * 4),
+                nn.ReLU(True),
+                # state size. (ngf*4) x 8 x 8
+                nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+    #            nn.BatchNorm2d(ngf * 2),
+                nn.ReLU(True),
+                # state size. (ngf*2) x 16 x 16
+                nn.ConvTranspose2d(ngf * 2,     nc, 4, 2, 1, bias=False),
+    #            nn.BatchNorm2d(ngf),
+    #            nn.ReLU(True),SGD
+    #            # state size. (ngf) x 32 x 32
+    #            nn.ConvTranspose2d(    ngf,      nc, 4, 2, 1, bias=False),
+                nn.Tanh()
+                # state size. (nc) x 64 x 64
+            )
+    
+        def forward(self, input):
+            if input.is_cuda and self.ngpu > 1:
+                output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
+            else:
+                output = self.main(input)
+            return output
+    
+    loss_subtype=[]  
+    loss_outer_subtype=[]
+    for subtype in subtype_pool: 
+    
+    
+        test_alpha=1.28e-4*np.float(train_alpha)*test_batch_size/train_batch_size#200
+            
+        datax=np.load('/media/rakib/Data/Data/GLO/Feature/'+test_dataset+'.npz')
+        x_test=datax['x_test']
+        x_test_org=x_test
+        if rotation_theta!=0:
+            x_rot=np.zeros((x_test.shape[0],nc,ngf,ndf))
+            for i in range (0, x_test.shape[0]):
+                for j in range (0, nc):
+                    x_rot[i,j,:,:]=rotate(x_test[i,j,:,:],rotation_theta,reshape=False)
+            x_test=x_rot       
+
+        #    dataz=np.load('/media/rakib/Data/Data/GLO/Feature/'+test_dataset+'_'+test_z_type+'_'+str(z_dim)+'.npz')
+        #    z_test=dataz['z_init_test']
+        if test_z_type=='Gauss':
+            z_test=np.zeros((x_test.shape[0],z_dim))
+            for i in range (0,z_test.shape[0]):
+                np.random.seed(seed)
+                z_test[i,:]=np.random.normal(loc=0.0, scale=1.0, size=(1,z_dim))
+        
+        elif test_z_type=='Optimum':
+            z_test=np.load( '/media/rakib/Data/Data/GLO/Results/'+train_dataset+'_'+'Gauss'+'_'+str(z_dim)+'_alpha'+str(np.float(train_alpha))+'_lr'+str(train_lr)+'_epochs'+str(200)+'wobatchnorm.npy') 
+        ## Select test size
+        if test_size !=-1:
+            x_test=x_test[test_start:test_start+test_size,:,:,:]            
+            x_test_org=x_test_org[test_start:test_start+test_size,:,:,:]
+            z_test=z_test[test_start:test_start+test_size,:]
+    
+    
+    #    generator = torch.load(  '/media/rakib/Data/Data/GLO/Model/'+train_dataset+'_'+train_z_type+'_'+str(z_dim)+'_alpha'+str(train_alpha)+'_lr'+str(train_lr)+'_epochs'+str(train_epochs)+'wobatchnorm')
+    #    optimizer = torch.optim.SGD(generator.parameters(), train_lr)
+    
+        # Random Matrix
+            # Random Matrix
+        if subtype=='linear' or subtype=='abs' or subtype=='square':
+            if isfile('/media/rakib/Data/Data/GLO/Feature/random_mask_'+str(test_batch_size)+'_'+str(sub_dim)+'_'+str(nc*ngf*ndf)+'_'+str(mask_id)+'.npy'):
+                mask=np.load('/media/rakib/Data/Data/GLO/Feature/random_mask_'+str(test_batch_size)+'_'+str(sub_dim)+'_'+str(nc*ngf*ndf)+'_'+str(mask_id)+'.npy')
+            else:
+                if mask_id>0:
+                    mask=np.random.normal(loc=0.0, scale=1.0/np.sqrt(sub_dim), size=(1,sub_dim,nc*ngf*ndf))
+                else:
+                    mask=(np.random.randn(test_batch_size,sub_dim,nc*ngf*ndf)+1j*np.random.randn(test_batch_size,sub_dim,nc*ngf*ndf))/np.sqrt(2*sub_dim)
+                np.save('/media/rakib/Data/Data/GLO/Feature/random_mask_'+str(test_batch_size)+'_'+str(sub_dim)+'_'+str(nc*ngf*ndf)+'_'+str(mask_id),mask)
+#            for i in range (0,test_batch_size):
+    #            mask[i]=mask[i]/np.linalg.norm(mask[i],ord=2)
+#                mask[i]=mask[i]/np.sqrt(sub_dim)
+            mask_tensor=torch.cuda.FloatTensor(mask).view(-1,sub_dim,nc*ngf*ndf)
+            
+    
+    # Applying mask
+        if subtype=='linear':
+            x_test=2*x_test-1
+            x_test_temp=np.zeros((x_test.shape[0],sub_dim,1))
+            for i in range (0, x_test.shape[0]):
+                x_test_temp[i,:,:]=np.matmul(mask[0,:,:],x_test[i,:,:,:].flatten().reshape(1,nc*ngf*ndf,1))
+            x_test=x_test_temp
+        elif subtype=='abs': 
+            x_test=2*x_test-1
+            x_test_temp=np.zeros((x_test.shape[0],sub_dim,1))
+            for i in range (0, x_test.shape[0]):
+                x_test_temp[i,:,:]=np.abs(np.matmul(mask[0,:,:],x_test[i,:,:,:].flatten().reshape(1,nc*ngf*ndf,1)))
+            x_test=x_test_temp
+        elif subtype=='square':
+            x_test=2*x_test-1
+            x_test_temp=np.zeros((x_test.shape[0],sub_dim,1))
+            for i in range (0, x_test.shape[0]):
+                x_test_temp[i,:,:]=np.square(np.matmul(mask[0,:,:],x_test[i,:,:,:].flatten().reshape(1,nc*ngf*ndf,1)))
+            x_test=x_test_temp
+    
+    
+        for i in range(z_test.shape[0]):
+            z_test[i] = z_test[i, :] / np.linalg.norm(z_test[i, :], 2)
+    
+  
+            
+        test_size=x_test.shape[0]
+        batch_no=np.int(np.ceil(test_size/test_batch_size))
+        idx=np.arange(test_size)
+        
+        x_rec=np.zeros((x_test.shape[0],nc,ngf,ndf))
+        x_rec1=np.zeros((x_test.shape[0],nc,ngf,ndf))
+        
+        init_loss=[]
+        loss_test_outer=[]
+        loss_test=[]
+        for batch_idx in range(0,batch_no):
+            x_best=np.zeros((test_batch_size,nc*ngf*ndf,1))
+#            z_test_temp=z_test
+            for rr in range (0,random_restart):
+                generator = torch.load(  '/media/rakib/Data/Data/GLO/Model/'+train_dataset+'_'+train_z_type+'_'+str(z_dim)+'_alpha'+str(train_alpha)+'_lr'+str(train_lr)+'_epochs'+str(train_epochs)+'wobatchnorm')
+                if opt=='SGD':
+                    optimizer = torch.optim.SGD(generator.parameters(), train_lr)
+                elif opt=='Adam':
+                    optimizer = torch.optim.Adam(generator.parameters(), train_lr) 
+        #        if batch_idx%100==0:
+    #            print(batch_idx)
+                epoch_idx=idx    
+                y=x_test[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:,0].reshape(test_batch_size,sub_dim,1)
+                x_true=2*x_test_org[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:,:,:].reshape(test_batch_size,nc*ngf*ndf,1)-1
+                
+                np.random.seed(seed) # Fixing seed
+                x=np.random.randn(test_batch_size,nc*ngf*ndf,1)
+                p=np.zeros(y.shape)
+        #        p=np.sign(y)
+                if x_init=='spectral':
+                    M=np.zeros((y.shape[0],nc*ngf*ndf,nc*ngf*ndf))
+                    for i in range (0,y.shape[0]):
+                        for j in range (0,sub_dim):
+                            A=mask[0,j,:].reshape(nc*ngf*ndf,1)
+                            M[i,:,:]=M[i,:,:]+(y[i,j,0]**2)*np.matmul(A,A.T)/sub_dim
+    #                    (u,v)=np.linalg.eig(M[i,:,:])
+    #                    u1=np.real(u)
+    #                    idd=np.argmax(u1)
+    #                    plt.plot(np.real(v[:,idd]))
+                    for i in range (0, M.shape[0]):
+                        loss_pow=[]
+                        for j in range (0,pow_it):
+                            Mx=np.dot(M[i,:,:],x[i,:,:]).reshape(x.shape[1],1)
+                            sol=Mx/np.linalg.norm(Mx,ord=2)
+                            loss_pow.append(np.mean((x[i,:,:]-sol)**2))
+                            x[i,:,:]=sol.reshape(x.shape[1],1)
+                        
+    #                    plt.figure()
+    #                    plt.imshow(x[i,:,0].reshape(ngf,ndf))
+    #                    plt.show()
+    #                    plt.figure()
+    #                    plt.plot(loss_pow)
+    #                    plt.show()
+    #                    plt.figure()
+    #                    plt.imshow(np.real(v[:,idd].reshape(ngf,ndf)))
+    #                    plt.show()
+                elif x_init=='power_project':
+#                    z_test_temp=z_test
+                    M=np.zeros((y.shape[0],nc*ngf*ndf,nc*ngf*ndf))
+                    for i in range (0,y.shape[0]):
+                        for j in range (0,sub_dim):
+                            A=mask[0,j,:].reshape(nc*ngf*ndf,1)
+                            M[i,:,:]=M[i,:,:]+(y[i,j,0]**2)*np.matmul(A,A.T)/sub_dim
+                    loss_pow_outer_epoch=[]
+                    for outer_epoch in range (0, pow_it):
+                        x_batch=x
+                        for i in range (0, M.shape[0]):
+        		            Mx=np.matmul(M[i,:,:],x[i,:,:]).reshape(x.shape[1])
+        		            sol=Mx/np.linalg.norm(Mx,ord=2)
+    #        		            sol_norm=(sol-np.min(sol))/(np.max(sol)-np.min(sol))
+    #        		            sol_norm=2*sol_norm-1
+        		            x_batch[i,:,:]=sol.reshape(x.shape[1],1)
+        		            
+                        loss_pow_outer_epoch.append(np.mean((x_true-x_batch)**2))
+        			#x_rec1[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:]=x_batch.reshape(test_batch_size,nc,ngf,ndf)
+#                        z_batch=z_test[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:]
+#                        np.random.seed(seed)
+                        z_batch= np.random.normal(loc=0.0, scale=1.0, size=(test_batch_size,z_dim))
+                        for i in range(z_batch.shape[0]):
+    	                    z_batch[i] = z_batch[i, :] / np.linalg.norm(z_batch[i, :], 2)
+                            
+                        loss_epoch=[]
+                        for epoch in range (0,test_pow_epochs):
+                            if subtype=='linear' or subtype=='abs' or subtype=='square':
+        		                x_batch_tensor=torch.cuda.FloatTensor(x_batch).view(-1, x_batch.shape[1],1)
+                            
+                            z_batch_tensor=torch.autograd.Variable(torch.cuda.FloatTensor(z_batch).view(-1, z_dim, 1, 1),requires_grad=True)
+                            x_hat = generator(z_batch_tensor)
+                            
+                            loss=nc*ngf*ndf*(x_hat.view(-1, nc* ngf*ndf,1) - x_batch_tensor).pow(2).mean()
+                            loss_epoch.append(loss.item())
+                            
+                            optimizer.zero_grad()
+                            loss.backward()        
+        		#            optimizer.step()
+                            with torch.no_grad():
+                                z_grad = z_batch_tensor.grad.data.cuda()
+                                z_update = z_batch_tensor - test_alpha * z_grad
+                                z_update = z_update.cpu().numpy()
+                                z_update=np.reshape(z_update,z_batch.shape)
+                                if z_norm_type=='unit_norm':
+                                    for i in range(z_update.shape[0]):
+            		                    z_update[i,:] = z_update[i, :] / np.linalg.norm(z_update[i, :], 2)
+                                z_batch=z_update
+                                z_test[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:]=z_update
+        		                
+                        z_update_tensor=torch.autograd.Variable(torch.cuda.FloatTensor(z_update).view(-1, z_dim, 1, 1))
+                        x_hat = generator(z_update_tensor)
+                        x=np.reshape(x_hat.cpu().detach().numpy(),x.shape)
+                        
+#                    z_test=z_test_temp
+                        
+                    #normalization
+#                    x_in=x
+#                    for i in range (0,x.shape[0]):
+#                        phi=np.sqrt(np.mean(y[i]**2))
+#    #                    x_phi=np.sqrt(np.mean(x[i]**2))
+#                        x[i]=x[i]*phi#/x_phi
+    
+    #                plt.figure()
+    #                plt.plot(loss_epoch)
+    #                plt.title('Generator loss during initialization (last projection)')
+    #                plt.figure()
+    #                plt.plot(loss_pow_outer_epoch)
+    #                plt.title('x update loss during initialization')
+    #                plt.show()
+                elif x_init=='zero':
+                    x=np.zeros((test_batch_size,nc*ngf*ndf,1))
+                    
+                x_in=x
+                #plt.figure()
+                loss_outer_epoch=[]
+                
+                
+                
+                
+                
+                
+                
+                ## Beginning
+                np.save('x_0',x)
+                
+                for outer_epoch in range (0, test_outer_epochs):
+                    if outer_epoch==0:
+                        test_middle_epochs=test_middle_epoch1
+                    else:
+                        test_middle_epochs=test_middle_epoch2
+                    for T in range(0,test_middle_epochs):
+                        for i in range (0, test_batch_size):
+                            p[i,:,:]=np.sign(np.matmul(mask[0,:,:],x[i,:,:]))
+                        b=np.multiply(p,y)
+                        x_batch=np.zeros(x.shape)
+                        for i in range (0, test_batch_size):
+                            A=mask[0,:,:].reshape(sub_dim,nc*ngf*ndf)
+            #                (sol,res,rank,sing)=np.linalg.lstsq(A, b[i].flatten())
+                            sol=x[i]+eta*np.matmul(A.T,(b[i]-np.matmul(A,x[i])))
+                            x_batch[i,:,:]=sol.reshape(nc*ngf*ndf,1)
+                        x=x_batch
+                    
+                    if outer_epoch==0:
+                        np.savez('w_p_0',w=x,p=p)
+                    elif outer_epoch==1:
+                        np.savez('w_p_1',w=x,p=p)  
+                    elif outer_epoch==test_outer_epochs-1:
+                        np.savez('w_p_end',w=x,p=p) 
+                    
+                    loss_outer_epoch.append(np.mean((x_true-x_batch)**2)) 
+                    
+                    loss_epoch=[]
+    
+                    
+#                    z_batch=z_test[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:]
+#                    np.random.seed(seed)
+                    z_batch= np.random.normal(loc=0.0, scale=1.0, size=(test_batch_size,z_dim))
+                    for i in range(z_batch.shape[0]):
+                        z_batch[i] = z_batch[i, :] / np.linalg.norm(z_batch[i, :], 2)
+                        
+                    for epoch in range (0,test_epochs):
+                        if subtype=='linear' or subtype=='abs' or subtype=='square':
+                            x_batch_tensor=torch.cuda.FloatTensor(x_batch).view(-1, x_batch.shape[1],1)
+        
+                        z_batch_tensor=torch.autograd.Variable(torch.cuda.FloatTensor(z_batch).view(-1, z_dim, 1, 1),requires_grad=True)
+        
+                        x_hat = generator(z_batch_tensor)
+        
+                        loss=nc*ngf*ndf*(x_hat.view(-1, nc* ngf*ndf,1) - x_batch_tensor).pow(2).mean()
+                        loss_epoch.append(loss.item())
+        
+                        optimizer.zero_grad()
+                        loss.backward()        
+            #            optimizer.step()
+        
+                        with torch.no_grad():        
+                            z_grad = z_batch_tensor.grad.data.cuda()    
+                            z_update = z_batch_tensor - test_alpha * z_grad
+                            z_update = z_update.cpu().numpy()
+                            z_update=np.reshape(z_update,z_batch.shape)
+                            if z_norm_type=='unit_norm':
+                                for i in range(z_update.shape[0]):
+                                    z_update[i,:] = z_update[i, :] / np.linalg.norm(z_update[i, :], 2)
+                            z_batch=z_update    
+                            z_test[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:]=z_update
+                            
+                    z_update_tensor=torch.autograd.Variable(torch.cuda.FloatTensor(z_update).view(-1, z_dim, 1, 1))
+                    x_hat = generator(z_update_tensor)
+                    x=np.reshape(x_hat.cpu().detach().numpy(),x.shape)
+                    
+                    if outer_epoch==0:
+                        np.savez('x_z_0',x=x,z=z_test)
+                    elif outer_epoch==1:
+                        np.savez('x_z_1',x=x,z=z_test) 
+                    elif outer_epoch==test_outer_epochs-2:
+                        np.savez('x_z_semi_end',x=x,z=z_test) 
+                    elif outer_epoch==test_outer_epochs-1:
+                        np.savez('x_z_end',x=x,z=z_test) 
+                        
+                if np.mean((x_true-x)**2)<np.mean((x_true-x_best)**2) or random_restart==1:
+                    x_best=x
+                    x_rec[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:]=x.reshape(x.shape[0],nc,ngf,ndf)
+                    x_rec1[epoch_idx[batch_idx*test_batch_size:np.min([(batch_idx+1)*test_batch_size,test_size])],:]=x_batch.reshape(x_batch.shape[0],nc,ngf,ndf)
+                    loss_epoch_best=loss_epoch
+                    loss_outer_epoch_best=loss_outer_epoch
+                    x_in_best=x_in
+#                z_test=z_test_temp
+                    #loss_test .append(np.array(loss_epoch))
+        #            plt.figure()
+        #            plt.plot( np.array(loss_epoch))
+    #            plt.plot(np.array(loss_outer_epoch))
+    #            plt.show()
+            init_loss.append(np.mean((x_true-x_in_best)**2)/np.mean(x_true**2))
+            loss_test .append(np.array(loss_epoch_best))
+            loss_test_outer.append(np.array(loss_outer_epoch_best))
+    #            plt.figure()
+    #            plt.plot(loss_outer_epoch)
+    #            plt.title('x update loss during testing')
+    #            plt.show()
+    
+        np.savez('/media/rakib/Data/Data/GLO/icassp2019/Results/'+train_dataset+'_'+test_z_type+'_'+str(z_dim)+z_norm_type+'_alpha'+str(test_alpha)+'_epochs'+str(test_epochs)+'_'+str(test_batch_size)+'phase_retrieval_init_'+x_init+'_eta_'+str(eta)+subtype+'_subsample_'+str(sub_dim),z_test=z_test,mask=mask,x_rec=x_rec)
+    
+        loss_outer_subtype.append(np.array(loss_test_outer))
+        loss_subtype.append(np.array(loss_test))
+
+
+    
+    
+        #    x_test=x_test/2+0.5
+        x_rec=x_rec/2+0.5
+        x_rec1=x_rec1/2+0.5
+        mse=np.mean((x_rec-x_test_org)**2)
+        print(mse)
+        psnr=20*np.log10((np.max(x_test_org)-np.min(x_test_org))/np.sqrt(mse))
+        
+
+        print(psnr)
+        
+        ssim_mnist=np.zeros(x_test_org.shape[0])
+        for i in range (0,x_test_org.shape[0]):
+            img1=x_test_org[i]
+            img2=x_rec[i]
+            if nc==3:
+                img_true=np.zeros((img1.shape[1],img1.shape[2],img1.shape[0]))
+                img_rec=np.zeros((img2.shape[1],img2.shape[2],img2.shape[0]))
+                for chan in range (0,nc):
+                    img_true[:,:,chan]=img1[chan,:,:]
+                    img_rec[:,:,chan]=img2[chan,:,:]
+                ssim_mnist[i]=ssim(img_true, img_rec,data_range=img_rec.max() - img_rec.min(), multichannel=True)
+            elif nc==1:
+                img_true=img1.reshape(ngf,ndf)  
+                img_rec=img2.reshape(ngf,ndf)  
+                ssim_mnist[i]=ssim(img_true, img_rec,data_range=img_rec.max() - img_rec.min())
+        
+        print(np.mean(ssim_mnist))
+        sub_dim_ssim.append(np.mean(ssim_mnist))
+        sub_dim_mse.append(mse)
+        sub_dim_psnr.append(psnr)
+        sub_dim_rec.append(x_rec)
+#        print(subtype)
+#        print(test_alpha)
+        
+    print('Initialization loss: ',np.mean(np.array(init_loss)))
+    print('Initialization loss var: ',np.var(np.array(init_loss)))
+    
+    for i in range (0,len(subtype_pool)):
+        plt.figure()
+        plt.plot(np.mean(loss_subtype[i],axis=0))
+        plt.xlabel('Epochs')
+        plt.ylabel('Reconstruction loss (Projection step) during testing')
+        plt.title('Reconstruction loss (Projection step) vs epochs during testing')
+        plt.figure()
+        plt.plot(np.mean(loss_outer_subtype[i],axis=0))
+        plt.xlabel('Epochs')
+        plt.ylabel('Reconstruction loss (Phase update step) during testing')
+        plt.title('Reconstruction loss (Phase update step) vs epochs during testing')
+    plt.show()
+
+	
+
+plt.figure()
+plt.plot(np.array(sub_dim_pool),np.array(sub_dim_mse),'*-')
+plt.xlabel('Number of measurements (m)')
+plt.ylabel('Reconstruction error (per pixel)')
+plt.show()
+
+plt.figure()
+plt.plot(np.array(sub_dim_pool),np.array(sub_dim_psnr),'*-')
+plt.xlabel('Number of measurements (m)')
+plt.ylabel('PSNR')
+plt.show()
+
+plt.figure()
+plt.plot(np.array(sub_dim_pool),np.array(sub_dim_ssim),'*-')
+plt.xlabel('Number of measurements (m)')
+plt.ylabel('Mean SSIM')
+plt.show()
+
+#x_diff=x_test_org-x_rec
+#
+#mm=np.mean((x_test_org-x_rec)**2,axis=(1,2,3)) 
+##mmx=np.argsort(mm)
+##midx=np.int(len(mmx)/2)
+##figset=[mmx[0+start_fig],mmx[1+start_fig],mmx[2+start_fig],mmx[midx-1-start_fig],mmx[midx],mmx[midx+1+start_fig],mmx[-3-start_fig],mmx[-2-start_fig],mmx[-1-start_fig]]
+figset=np.arange(10)
+
+#print(figset)
+fig_row=len(sub_dim_pool)+1
+plt.figure(figsize=(20, fig_row*2))
+n=10
+for i in range(n):
+
+    if nc==1:
+        for sublen in range(0,len(sub_dim_pool)):
+            
+            ax = plt.subplot(fig_row, n, i + 1+sublen*n)
+            tempfig=sub_dim_rec[sublen]
+            plt.imshow(tempfig[i].reshape(ngf, ndf))
+            plt.gray()
+            ax.get_xaxis().set_visible(False)
+            ax.get_yaxis().set_visible(False)
+            plt.title(str(sub_dim_pool[sublen ]))
+            
+        ax = plt.subplot(fig_row, n, i + 1+fig_row*n-n)
+        plt.imshow(x_test_org[figset[i]].reshape(ngf, ndf))
+        plt.gray()
+        ax.get_xaxis().set_visible(False)
+        ax.get_yaxis().set_visible(False)
+        plt.title('Original')
+
+    elif nc==3:
+        for sublen in range(0,len(sub_dim_pool)):
+            ax =plt.subplot(fig_row, n, i + 1+sublen*n)
+            tempfig=sub_dim_rec[sublen]
+            temp=tempfig[figset[i]]
+            temp1=np.zeros((ngf, ndf,nc))
+            for chan in range (0,nc):
+                temp1[:,:,chan]=temp[chan,:,:]
+            plt.imshow(temp1)
+#            plt.gray()
+            ax.get_xaxis().set_visible(False)
+            ax.get_yaxis().set_visible(False)
+            plt.title(str(sub_dim_pool[sublen ]))
+
+        ax = plt.subplot(fig_row, n, i + 1+fig_row*n-n)     
+        temp=x_test_org[figset[i]]
+        temp1=np.zeros((ngf, ndf,nc))
+        for chan in range (0,nc):
+            temp1[:,:,chan]=temp[chan,:,:]
+        plt.imshow(temp1)
+#            plt.gray()
+        ax.get_xaxis().set_visible(False)
+        ax.get_yaxis().set_visible(False)
+        plt.title('Original')
+#    plt.savefig(test_dataset+'_test_rec_test_epoch_'+str(test_epochs))  
+plt.show()
+
+
+
+torch.cuda.empty_cache()
